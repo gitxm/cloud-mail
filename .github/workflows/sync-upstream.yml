@@ -1,0 +1,172 @@
+# 上游 maillab/cloud-mail 发布新版本时，自动合并到本 fork 并触发上游自带的部署 workflow。
+# 状态标记：本仓库的 tag `deployed-<版本>` 表示该版本已成功上线；没有新版本时整个流程空跑。
+# 安全网：升级前用 Cloudflare D1 Time Travel 回滚（wrangler d1 time-travel restore dqdd --bookmark <id>）。
+name: 🔄 Sync upstream release
+
+on:
+  schedule:
+    - cron: "0 19 * * *"   # 每天北京时间 03:00，收信低峰
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "指定上游版本（留空 = 最新 release）"
+        required: false
+        default: ""
+      skip_deploy:
+        description: "只合并代码不部署（true/false）"
+        required: false
+        default: "false"
+
+permissions:
+  contents: write
+  actions: write
+  issues: write
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+env:
+  UPSTREAM: maillab/cloud-mail
+  SITE: https://m.dqdd.de
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出仓库
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: 解析目标版本
+        id: up
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          TAG="$INPUT_TAG"
+          if [ -z "$TAG" ]; then
+            TAG=$(gh api "repos/$UPSTREAM/releases/latest" --jq .tag_name)
+          fi
+          if [ -z "$TAG" ]; then
+            echo "拿不到上游版本号"
+            exit 1
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "目标版本：$TAG"
+
+      - name: 判断是否已上线
+        id: gate
+        env:
+          TAG: ${{ steps.up.outputs.tag }}
+        run: |
+          DEPLOYED=$(git tag -l 'deployed-*' | sed 's|^deployed-||' | sort -V | tail -1)
+          echo "当前已上线：${DEPLOYED:-无}"
+          if [ "$TAG" = "$DEPLOYED" ]; then
+            echo "need=false" >> "$GITHUB_OUTPUT"
+            echo "已是最新，本次不部署。"
+          else
+            echo "need=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: 合并上游版本
+        if: steps.gate.outputs.need == 'true'
+        env:
+          TAG: ${{ steps.up.outputs.tag }}
+        run: |
+          git config user.name "cloud-mail-sync"
+          git config user.email "sync@users.noreply.github.com"
+          git remote add upstream "https://github.com/$UPSTREAM.git"
+          git fetch upstream "refs/tags/$TAG:refs/tags/$TAG" --force
+          git merge --no-edit -m "chore: 同步上游 $TAG" "refs/tags/$TAG"
+          git push origin HEAD:main
+
+      - name: 触发部署并等待结果
+        id: deploy
+        if: steps.gate.outputs.need == 'true' && inputs.skip_deploy != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          BEFORE=$(gh run list --workflow deploy-cloudflare.yml --limit 1 --json databaseId --jq '.[0].databaseId // 0')
+          gh workflow run deploy-cloudflare.yml --ref main
+          RUN_ID=""
+          for i in $(seq 1 20); do
+            sleep 15
+            RUN_ID=$(gh run list --workflow deploy-cloudflare.yml --limit 1 --json databaseId --jq '.[0].databaseId // 0')
+            if [ "$RUN_ID" != "$BEFORE" ] && [ "$RUN_ID" != "0" ]; then break; fi
+            RUN_ID=""
+          done
+          if [ -z "$RUN_ID" ]; then
+            echo "没有等到新的部署运行"
+            exit 1
+          fi
+          echo "部署运行 ID：$RUN_ID"
+          gh run watch "$RUN_ID" --exit-status --interval 30
+
+      - name: 校验站点可用
+        if: steps.deploy.outcome == 'success'
+        env:
+          SITE_URL: ${{ env.SITE }}
+        run: |
+          for i in 1 2 3 4 5; do
+            CODE=$(curl -s -o /dev/null -w '%{http_code}' "$SITE_URL/")
+            echo "首页 HTTP $CODE"
+            if [ "$CODE" = "200" ]; then exit 0; fi
+            sleep 10
+          done
+          echo "站点不可用"
+          exit 1
+
+      - name: 校验表结构已升级
+        if: steps.deploy.outcome == 'success'
+        env:
+          CF_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          DB_ID: ${{ vars.D1_DATABASE_ID }}
+        run: |
+          q() {
+            jq -cn --arg sql "$1" '{sql:$sql}' \
+              | curl -s -X POST \
+                  "https://api.cloudflare.com/client/v4/accounts/$ACCOUNT_ID/d1/database/$DB_ID/query" \
+                  -H "Authorization: Bearer $CF_TOKEN" \
+                  -H 'Content-Type: application/json' --data @- \
+              | jq -r '[.result[0].results[]? | .name] | join(" ")'
+          }
+          SETTING="$(q "SELECT name FROM pragma_table_info('setting')")"
+          EMAIL="$(q "SELECT name FROM pragma_table_info('email')")"
+          IDX="$(q "SELECT name FROM sqlite_master WHERE type='index'")"
+          fail=0
+          for col in sync_delete webhook_url auto_clean_days; do
+            grep -qw "$col" <<< "$SETTING" || { echo "缺字段 setting.$col"; fail=1; }
+          done
+          for col in code sender_email; do
+            grep -qw "$col" <<< "$EMAIL" || { echo "缺字段 email.$col"; fail=1; }
+          done
+          for idx in idx_email_create_time idx_email_list_user; do
+            grep -qw "$idx" <<< "$IDX" || { echo "缺索引 $idx"; fail=1; }
+          done
+          if [ "$fail" -ne 0 ]; then
+            echo "表结构没有完整升级，需要手工补：wrangler d1 execute dqdd --remote --command \"...\""
+            exit 1
+          fi
+          echo "表结构校验通过"
+
+      - name: 标记该版本已上线
+        if: success() && steps.gate.outputs.need == 'true' && inputs.skip_deploy != 'true'
+        env:
+          TAG: ${{ steps.up.outputs.tag }}
+        run: |
+          git tag "deployed-$TAG"
+          git push origin "deployed-$TAG"
+
+      - name: 失败时建 issue 通知
+        if: failure()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.up.outputs.tag }}
+        run: |
+          gh issue create \
+            --title "【自动升级失败】cloud-mail ${TAG:-未知版本}" \
+            --body "上游版本 ${TAG:-未知} 的自动同步/部署/校验失败。运行记录：${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
