@@ -1,8 +1,8 @@
-# 上游 maillab/cloud-mail 发布新版本时，自动对齐到该版本并触发上游自带的部署 workflow。
-# 上游会重写历史，所以这里不做 merge，而是硬对齐到上游 tag，再把本文件保留回 main。
-# 状态标记：本仓库的 tag `deployed-<版本>` 表示该版本已成功上线；没有新版本时整个流程空跑。
+# 自动跟踪上游 maillab/cloud-mail 的 release：拉取指定版本源码 → pnpm 构建 → wrangler 部署 → 数据库升级 → 校验。
+# 不需要镜像上游代码，也不需要 PAT：直接用本仓库的 GITHUB_TOKEN（只推 tag 作为状态标记）。
+# 状态标记：tag `deployed-<版本>`，表示该版本已成功上线；没有新版本时整个流程空跑。
 # 安全网：升级前用 Cloudflare D1 Time Travel 回滚（wrangler d1 time-travel restore dqdd --bookmark <id>）。
-name: 🔄 Sync upstream release
+name: 🚀 自动升级 cloud-mail
 
 on:
   schedule:
@@ -14,16 +14,15 @@ on:
         required: false
         default: ""
       skip_deploy:
-        description: "只同步代码不部署（true/false）"
+        description: "只解析版本不部署（true/false）"
         required: false
         default: "false"
 
 permissions:
   contents: write
-  actions: write
 
 concurrency:
-  group: sync-upstream
+  group: cloud-mail-upgrade
   cancel-in-progress: false
 
 env:
@@ -31,15 +30,9 @@ env:
   SITE: https://m.dqdd.de
 
 jobs:
-  sync:
+  upgrade:
     runs-on: ubuntu-latest
     steps:
-      - name: 检出仓库
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-          fetch-tags: true
-
       - name: 解析目标版本
         id: up
         env:
@@ -60,9 +53,11 @@ jobs:
       - name: 判断是否已上线
         id: gate
         env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ steps.up.outputs.tag }}
         run: |
-          DEPLOYED=$(git tag -l 'deployed-*' | sed 's|^deployed-||' | sort -V | tail -1)
+          REFS=$(gh api "repos/${{ github.repository }}/git/matching-refs/tags/deployed-" --jq '[.[].ref | sub("^refs/tags/deployed-"; "")] | join(" ")')
+          DEPLOYED=$(printf '%s\n' $REFS | sort -V | tail -1)
           echo "当前已上线：${DEPLOYED:-无}"
           if [ "$TAG" = "$DEPLOYED" ]; then
             echo "need=false" >> "$GITHUB_OUTPUT"
@@ -71,48 +66,88 @@ jobs:
             echo "need=true" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: 对齐到上游版本
-        if: steps.gate.outputs.need == 'true'
-        env:
-          TAG: ${{ steps.up.outputs.tag }}
-        run: |
-          git config user.name "cloud-mail-sync"
-          git config user.email "sync@users.noreply.github.com"
-          git show HEAD:.github/workflows/sync-upstream.yml > /tmp/sync-upstream.yml
-          git remote add upstream "https://github.com/$UPSTREAM.git"
-          git fetch upstream "refs/tags/$TAG:refs/tags/$TAG" --force
-          git reset --hard "refs/tags/$TAG"
-          mkdir -p .github/workflows
-          cp /tmp/sync-upstream.yml .github/workflows/sync-upstream.yml
-          git add .github/workflows/sync-upstream.yml
-          git commit -m "ci: 对齐上游 $TAG 并保留自动升级 workflow"
-          git push --force origin HEAD:main
-          echo "main 已对齐到 $TAG（$(git rev-parse --short HEAD)）"
+      - name: 拉取上游源码
+        if: steps.gate.outputs.need == 'true' && inputs.skip_deploy != 'true'
+        uses: actions/checkout@v4
+        with:
+          repository: maillab/cloud-mail
+          ref: ${{ steps.up.outputs.tag }}
+          path: src
+          fetch-depth: 1
 
-      - name: 触发部署并等待结果
-        id: deploy
+      - name: 设置 pnpm
+        if: steps.gate.outputs.need == 'true' && inputs.skip_deploy != 'true'
+        uses: pnpm/action-setup@v4.1.0
+        with:
+          version: 11
+
+      - name: 设置 Node.js
+        if: steps.gate.outputs.need == 'true' && inputs.skip_deploy != 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: 安装 worker 依赖
+        if: steps.gate.outputs.need == 'true' && inputs.skip_deploy != 'true'
+        working-directory: ./src/mail-worker
+        run: pnpm install --frozen-lockfile
+
+      - name: 生成部署配置
+        if: steps.gate.outputs.need == 'true' && inputs.skip_deploy != 'true'
+        working-directory: ./src/mail-worker
+        env:
+          NAME: ${{ vars.NAME }}
+          CUSTOM_DOMAIN: ${{ vars.CUSTOM_DOMAIN }}
+          DOMAIN: ${{ vars.DOMAIN }}
+          ADMIN: ${{ secrets.ADMIN }}
+          JWT_SECRET: ${{ secrets.JWT_SECRET }}
+          D1_DATABASE_ID: ${{ vars.D1_DATABASE_ID }}
+          KV_NAMESPACE_ID: ${{ vars.KV_NAMESPACE_ID }}
+          R2_BUCKET_NAME: ${{ vars.R2_BUCKET_NAME }}
+          AI_MODEL: ${{ vars.AI_MODEL }}
+          ANALYSIS_CACHE: ${{ vars.ANALYSIS_CACHE }}
+        run: |
+          cp wrangler-action.toml wrangler-deploy.toml
+          sed -i '/^\[\[send_email\]\]/,/^$/d' wrangler-deploy.toml
+          sed -i '/^project_link = /d' wrangler-deploy.toml
+          sed -i "s|\${NAME}|${NAME}|g" wrangler-deploy.toml
+          sed -i "s|\${CUSTOM_DOMAIN}|${CUSTOM_DOMAIN}|g" wrangler-deploy.toml
+          sed -i "s|\"\${DOMAIN}\"|${DOMAIN}|g" wrangler-deploy.toml
+          sed -i "s|\${ADMIN}|${ADMIN}|g" wrangler-deploy.toml
+          sed -i "s|\${JWT_SECRET}|${JWT_SECRET}|g" wrangler-deploy.toml
+          sed -i "s|\${R2_BUCKET_NAME}|${R2_BUCKET_NAME}|g" wrangler-deploy.toml
+          sed -i "s|\${ANALYSIS_CACHE}|${ANALYSIS_CACHE}|g" wrangler-deploy.toml
+          sed -i "s|\${AI_MODEL}|${AI_MODEL}|g" wrangler-deploy.toml
+          sed -i "s|\${D1_DATABASE_ID}|${D1_DATABASE_ID}|g" wrangler-deploy.toml
+          sed -i "s|\${KV_NAMESPACE_ID}|${KV_NAMESPACE_ID}|g" wrangler-deploy.toml
+          sed -i "s|\${PROJECT_LINK}|/|g" wrangler-deploy.toml
+          echo "=== 部署配置（敏感字段已隐藏） ==="
+          sed -E 's/(jwt_secret|admin) = .*/\1 = (***)/' wrangler-deploy.toml
+
+      - name: 部署到 Cloudflare
+        if: steps.gate.outputs.need == 'true' && inputs.skip_deploy != 'true'
+        working-directory: ./src/mail-worker
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: pnpm wrangler deploy -c wrangler-deploy.toml
+
+      - name: 升级数据库结构与配置
         if: steps.gate.outputs.need == 'true' && inputs.skip_deploy != 'true'
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          JWT_SECRET: ${{ secrets.JWT_SECRET }}
+          SITE_URL: ${{ env.SITE }}
         run: |
-          BEFORE=$(gh run list --workflow deploy-cloudflare.yml --limit 1 --json databaseId --jq '.[0].databaseId // 0')
-          gh workflow run deploy-cloudflare.yml --ref main
-          RUN_ID=""
-          for i in $(seq 1 20); do
-            sleep 15
-            RUN_ID=$(gh run list --workflow deploy-cloudflare.yml --limit 1 --json databaseId --jq '.[0].databaseId // 0')
-            if [ "$RUN_ID" != "$BEFORE" ] && [ "$RUN_ID" != "0" ]; then break; fi
-            RUN_ID=""
-          done
-          if [ -z "$RUN_ID" ]; then
-            echo "没有等到新的部署运行"
+          sleep 10
+          BODY=$(curl -sL --max-time 120 "$SITE_URL/api/init/${JWT_SECRET}")
+          echo "init 返回：${BODY:0:200}"
+          if [ "$BODY" != "success" ]; then
+            echo "::error::数据库初始化失败，注意 /api/init 内部失败会被 try/catch 吞掉，必须看下一步校验结果"
             exit 1
           fi
-          echo "部署运行 ID：$RUN_ID"
-          gh run watch "$RUN_ID" --exit-status --interval 30
 
       - name: 校验站点可用
-        if: steps.deploy.outcome == 'success'
+        if: steps.gate.outputs.need == 'true' && inputs.skip_deploy != 'true'
         env:
           SITE_URL: ${{ env.SITE }}
         run: |
@@ -126,7 +161,7 @@ jobs:
           exit 1
 
       - name: 校验表结构已升级
-        if: steps.deploy.outcome == 'success'
+        if: steps.gate.outputs.need == 'true' && inputs.skip_deploy != 'true'
         env:
           CF_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
@@ -162,14 +197,9 @@ jobs:
       - name: 标记该版本已上线
         if: success() && steps.gate.outputs.need == 'true' && inputs.skip_deploy != 'true'
         env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ steps.up.outputs.tag }}
         run: |
-          git tag "deployed-$TAG"
-          git push origin "deployed-$TAG"
-
-      - name: 失败时标红提示
-        if: failure()
-        env:
-          TAG: ${{ steps.up.outputs.tag }}
-        run: |
-          echo "::error::cloud-mail 自动升级失败（版本 ${TAG:-未知}），见运行记录 ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          SHA=$(gh api "repos/${{ github.repository }}/git/ref/heads/main" --jq .object.sha)
+          gh api -X POST "repos/${{ github.repository }}/git/refs" -f ref="refs/tags/deployed-$TAG" -f sha="$SHA"
+          echo "已标记 deployed-$TAG"
