@@ -1,4 +1,5 @@
-# 上游 maillab/cloud-mail 发布新版本时，自动合并到本 fork 并触发上游自带的部署 workflow。
+# 上游 maillab/cloud-mail 发布新版本时，自动对齐到该版本并触发上游自带的部署 workflow。
+# 上游会重写历史，所以这里不做 merge，而是硬对齐到上游 tag，再把本文件保留回 main。
 # 状态标记：本仓库的 tag `deployed-<版本>` 表示该版本已成功上线；没有新版本时整个流程空跑。
 # 安全网：升级前用 Cloudflare D1 Time Travel 回滚（wrangler d1 time-travel restore dqdd --bookmark <id>）。
 name: 🔄 Sync upstream release
@@ -13,14 +14,13 @@ on:
         required: false
         default: ""
       skip_deploy:
-        description: "只合并代码不部署（true/false）"
+        description: "只同步代码不部署（true/false）"
         required: false
         default: "false"
 
 permissions:
   contents: write
   actions: write
-  issues: write
 
 concurrency:
   group: sync-upstream
@@ -71,17 +71,23 @@ jobs:
             echo "need=true" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: 合并上游版本
+      - name: 对齐到上游版本
         if: steps.gate.outputs.need == 'true'
         env:
           TAG: ${{ steps.up.outputs.tag }}
         run: |
           git config user.name "cloud-mail-sync"
           git config user.email "sync@users.noreply.github.com"
+          git show HEAD:.github/workflows/sync-upstream.yml > /tmp/sync-upstream.yml
           git remote add upstream "https://github.com/$UPSTREAM.git"
           git fetch upstream "refs/tags/$TAG:refs/tags/$TAG" --force
-          git merge --no-edit -m "chore: 同步上游 $TAG" "refs/tags/$TAG"
-          git push origin HEAD:main
+          git reset --hard "refs/tags/$TAG"
+          mkdir -p .github/workflows
+          cp /tmp/sync-upstream.yml .github/workflows/sync-upstream.yml
+          git add .github/workflows/sync-upstream.yml
+          git commit -m "ci: 对齐上游 $TAG 并保留自动升级 workflow"
+          git push --force origin HEAD:main
+          echo "main 已对齐到 $TAG（$(git rev-parse --short HEAD)）"
 
       - name: 触发部署并等待结果
         id: deploy
@@ -148,7 +154,7 @@ jobs:
             grep -qw "$idx" <<< "$IDX" || { echo "缺索引 $idx"; fail=1; }
           done
           if [ "$fail" -ne 0 ]; then
-            echo "表结构没有完整升级，需要手工补：wrangler d1 execute dqdd --remote --command \"...\""
+            echo "::error::表结构没有完整升级，需要手工补：wrangler d1 execute dqdd --remote --command='...'"
             exit 1
           fi
           echo "表结构校验通过"
@@ -161,12 +167,9 @@ jobs:
           git tag "deployed-$TAG"
           git push origin "deployed-$TAG"
 
-      - name: 失败时建 issue 通知
+      - name: 失败时标红提示
         if: failure()
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ steps.up.outputs.tag }}
         run: |
-          gh issue create \
-            --title "【自动升级失败】cloud-mail ${TAG:-未知版本}" \
-            --body "上游版本 ${TAG:-未知} 的自动同步/部署/校验失败。运行记录：${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          echo "::error::cloud-mail 自动升级失败（版本 ${TAG:-未知}），见运行记录 ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
